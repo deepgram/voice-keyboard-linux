@@ -297,6 +297,10 @@ impl<H: KeyboardHardware> VirtualKeyboard<H> {
                 debug!("Backspacing {} characters", chars_to_backspace);
                 for _ in 0..chars_to_backspace {
                     self.hardware.press_backspace()?;
+                    // Space out backspaces so the target app doesn't drop them.
+                    // Without this, long mid-stream revisions lose most of the
+                    // deletes and the corrected text layers over the old text.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
 
