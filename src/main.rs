@@ -13,7 +13,7 @@ mod stt_client;
 mod virtual_keyboard;
 
 use audio_input::AudioInput;
-use stt_client::{AudioBuffer, SttClient};
+use stt_client::{AudioBuffer, SttClient, TurnConfig};
 use virtual_keyboard::{RealKeyboardHardware, VirtualKeyboard};
 use std::time::Instant;
 
@@ -150,6 +150,29 @@ async fn main() -> Result<()> {
                 .help("Convert all typed text to uppercase")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("eot-threshold")
+                .long("eot-threshold")
+                .help(
+                    "Flux end-of-turn confidence threshold (0.0-1.0). Higher = less \
+                     sensitive; waits until more confident you've finished speaking",
+                )
+                .value_name("FLOAT")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("eot-timeout-ms")
+                .long("eot-timeout-ms")
+                .help("Flux end-of-turn silence timeout in milliseconds (longer = tolerates longer pauses)")
+                .value_name("MS")
+                .value_parser(clap::value_parser!(u32)),
+        )
+        .arg(
+            Arg::new("stop-on-eot")
+                .long("stop-on-eot")
+                .help("Exit after the first end-of-turn (one-shot dictation)")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let device_name = "Voice Keyboard";
@@ -170,6 +193,12 @@ async fn main() -> Result<()> {
         .drop_privileges()
         .context("Failed to drop root privileges")?;
 
+    let turn = TurnConfig {
+        eot_threshold: matches.get_one::<f64>("eot-threshold").copied(),
+        eot_timeout_ms: matches.get_one::<u32>("eot-timeout-ms").copied(),
+    };
+    let stop_on_eot = matches.get_flag("stop-on-eot");
+
     if matches.get_flag("test-audio") {
         test_audio().await?;
     } else if matches.get_flag("test-stt") {
@@ -177,7 +206,7 @@ async fn main() -> Result<()> {
             .get_one::<String>("stt-url")
             .map(|s| s.as_str())
             .unwrap_or(stt_client::STT_URL);
-        test_stt(keyboard, stt_url).await?;
+        test_stt(keyboard, stt_url, turn, stop_on_eot).await?;
     } else {
         let debug_mode = matches.get_flag("debug-stt");
         let stt_url = matches
@@ -186,9 +215,9 @@ async fn main() -> Result<()> {
             .unwrap_or(stt_client::STT_URL);
 
         if debug_mode {
-            debug_stt(stt_url).await?;
+            debug_stt(stt_url, turn).await?;
         } else {
-            test_stt(keyboard, stt_url).await?;
+            test_stt(keyboard, stt_url, turn, stop_on_eot).await?;
         }
     }
 
@@ -237,12 +266,23 @@ async fn test_audio() -> Result<()> {
     Ok(())
 }
 
-async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str) -> Result<()> {
+async fn test_stt(
+    keyboard: VirtualKeyboard<RealKeyboardHardware>,
+    stt_url: &str,
+    turn: TurnConfig,
+    stop_on_eot: bool,
+) -> Result<()> {
     info!("Testing speech-to-text functionality...");
 
     // Wrap keyboard in a mutex to allow mutable access from the closure
     let keyboard = std::sync::Arc::new(std::sync::Mutex::new(keyboard));
     let keyboard_clone = keyboard.clone();
+
+    // One-shot auto-stop: on the first end-of-turn the callback fires this,
+    // which run_stt selects on to shut down cleanly (typing the last turn first).
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stop_signal = std::sync::Arc::new(std::sync::Mutex::new(Some(stop_tx)));
+    let stop_signal_cl = stop_signal.clone();
     // Rate-limit plain Update logs to at most once per second
     let last_update_log = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
     let last_update_log_cloned = last_update_log.clone();
@@ -285,10 +325,19 @@ async fn test_stt(keyboard: VirtualKeyboard<RealKeyboardHardware>, stt_url: &str
                 }
             }
         }
-    }).await
+        drop(kb);
+
+        // One-shot mode: after the turn is typed, signal shutdown so the app
+        // stops itself.
+        if stop_on_eot && result.event == "EndOfTurn" {
+            if let Some(tx) = stop_signal_cl.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }, turn, if stop_on_eot { Some(stop_rx) } else { None }).await
 }
 
-async fn debug_stt(stt_url: &str) -> Result<()> {
+async fn debug_stt(stt_url: &str, turn: TurnConfig) -> Result<()> {
     info!("Debugging speech-to-text functionality...");
     info!("STT Service URL: {}", stt_url);
 
@@ -297,11 +346,16 @@ async fn debug_stt(stt_url: &str) -> Result<()> {
         if !result.transcript.is_empty() {
             info!("Transcription [{}]: {}", result.event, result.transcript);
         }
-    })
+    }, turn, None)
     .await
 }
 
-async fn run_stt<F>(stt_url: &str, on_transcription: F) -> Result<()>
+async fn run_stt<F>(
+    stt_url: &str,
+    on_transcription: F,
+    turn: TurnConfig,
+    stop_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()>
 where
     F: Fn(stt_client::TranscriptionResult) + Send + 'static,
 {
@@ -313,7 +367,7 @@ where
     );
 
     let mut audio_buffer = AudioBuffer::new(audio_input.get_sample_rate(), 160);
-    let stt_client = SttClient::new(stt_url, audio_input.get_sample_rate());
+    let stt_client = SttClient::new(stt_url, audio_input.get_sample_rate()).with_turn(turn);
 
     info!(?stt_url, "Connecting to STT service...");
     let (audio_tx, handle) = stt_client
@@ -354,8 +408,17 @@ where
         }
     })?;
 
-    // Just wait for the STT client to finish (will be interrupted by Ctrl+C)
-    handle.await??;
+    // Wait for the STT client to finish (interrupted by Ctrl+C), or for an
+    // end-of-turn auto-stop signal from the callback if one was requested.
+    match stop_rx {
+        Some(rx) => {
+            tokio::select! {
+                res = handle => res??,
+                _ = rx => info!("End of turn reached; stopping (--stop-on-eot)"),
+            }
+        }
+        None => handle.await??,
+    }
 
     Ok(())
 }
