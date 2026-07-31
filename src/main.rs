@@ -314,6 +314,31 @@ where
 
     let mut audio_buffer = AudioBuffer::new(audio_input.get_sample_rate(), 160);
     let stt_client = SttClient::new(stt_url, audio_input.get_sample_rate());
+    let channels = audio_input.get_channels();
+
+    // Start capturing IMMEDIATELY into an unbounded buffer, *before* connecting,
+    // so the leading audio spoken during device warm-up and the WebSocket
+    // handshake isn't lost. Captured chunks are flushed to the STT socket once
+    // it's up (see the bridge task below).
+    let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    audio_input.start_recording(move |data| {
+        // Average stereo channels to mono
+        let mono_data: Vec<f32> = if channels == 2 {
+            let mut mono = Vec::with_capacity(data.len() / 2);
+            for chunk in data.chunks_exact(2) {
+                mono.push((chunk[0] + chunk[1]) / 2.0);
+            }
+            mono
+        } else {
+            data.to_vec()
+        };
+
+        for chunk in audio_buffer.add_samples(&mono_data) {
+            // Unbounded, non-blocking send: safe from the realtime audio thread.
+            let _ = cap_tx.send(chunk);
+        }
+    })?;
+    info!("Microphone live; capturing (buffered until connected)...");
 
     info!(?stt_url, "Connecting to STT service...");
     let (audio_tx, handle) = stt_client
@@ -324,37 +349,32 @@ where
     info!("Listening for speech... Speak into your microphone!");
     info!("Press Ctrl+C to stop.");
 
-    let audio_tx = std::sync::Arc::new(audio_tx);
-    let audio_tx_clone = audio_tx.clone();
-    let channels = audio_input.get_channels();
-
-    // Start recording
-    audio_input.start_recording(move |data| {
-        debug!("Received audio data: {} samples", data.len());
-
-        // Average stereo channels to mono
-        let mono_data: Vec<f32> = if channels == 2 {
-            let mut mono = Vec::with_capacity(data.len() / 2);
-            for chunk in data.chunks_exact(2) {
-                mono.push((chunk[0] + chunk[1]) / 2.0);
-            }
-            debug!("Averaged samples: {}", mono.len());
-            mono
-        } else {
-            data.to_vec()
-        };
-
-        // Create audio chunks and send them
-        let chunks = audio_buffer.add_samples(&mono_data);
-        for chunk in chunks {
-            debug!("Sending audio chunk: {} bytes", chunk.len());
-            if let Err(e) = audio_tx_clone.blocking_send(chunk) {
-                error!("Failed to send audio chunk: {}", e);
+    // Bridge captured audio into the STT socket: the backlog buffered during
+    // connect is flushed first, then live audio streams through. Ends when the
+    // audio stream stops (cap_tx dropped) or the socket closes.
+    let _bridge = tokio::spawn(async move {
+        // Flush and report the backlog captured while we were connecting.
+        let mut buffered = 0usize;
+        while let Ok(chunk) = cap_rx.try_recv() {
+            buffered += 1;
+            if audio_tx.send(chunk).await.is_err() {
+                return;
             }
         }
-    })?;
+        debug!(
+            "Flushed {} buffered audio chunk(s) (~{} ms) captured during connect",
+            buffered,
+            buffered * 160
+        );
+        // Then stream live audio.
+        while let Some(chunk) = cap_rx.recv().await {
+            if audio_tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+    });
 
-    // Just wait for the STT client to finish (will be interrupted by Ctrl+C)
+    // Wait for the STT client to finish (will be interrupted by Ctrl+C).
     handle.await??;
 
     Ok(())
