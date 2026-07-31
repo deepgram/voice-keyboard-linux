@@ -102,9 +102,20 @@ fn enrich_ws_error(err: WsError) -> anyhow::Error {
     }
 }
 
+/// Flux turn-taking tuning. Higher `eot_threshold` makes end-of-turn detection
+/// less sensitive (the model waits until it's more confident you've finished);
+/// larger `eot_timeout_ms` tolerates longer silent pauses before ending a turn.
+/// `None` leaves the server default in place.
+#[derive(Clone, Copy, Default)]
+pub struct TurnConfig {
+    pub eot_threshold: Option<f64>,
+    pub eot_timeout_ms: Option<u32>,
+}
+
 pub struct SttClient {
     url: String,
     sample_rate: u32,
+    turn: TurnConfig,
 }
 
 impl SttClient {
@@ -112,7 +123,14 @@ impl SttClient {
         Self {
             url: url.to_string(),
             sample_rate,
+            turn: TurnConfig::default(),
         }
+    }
+
+    /// Set Flux turn-taking parameters (builder-style).
+    pub fn with_turn(mut self, turn: TurnConfig) -> Self {
+        self.turn = turn;
+        self
     }
 
     pub async fn connect_and_transcribe<F>(
@@ -123,10 +141,17 @@ impl SttClient {
         F: FnMut(TranscriptionResult) + Send + 'static,
     {
         // Build WebSocket URL with query parameters
-        let ws_url = format!(
+        let mut ws_url = format!(
             "{}?model=flux-general-en&sample_rate={}&encoding=linear16",
             self.url, self.sample_rate
         );
+        // Optional Flux turn-taking overrides.
+        if let Some(t) = self.turn.eot_threshold {
+            ws_url.push_str(&format!("&eot_threshold={t}"));
+        }
+        if let Some(ms) = self.turn.eot_timeout_ms {
+            ws_url.push_str(&format!("&eot_timeout_ms={ms}"));
+        }
 
         debug!("Connecting to speech-to-text service: {}", ws_url);
 
